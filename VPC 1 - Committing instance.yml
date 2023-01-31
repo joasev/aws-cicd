@@ -1,0 +1,277 @@
+Mappings:
+  RegionMap:
+    us-east-1:
+      AMI: ami-0b5eea76982371e91
+
+Parameters:
+  PrivateKeyName: 
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: The name of the private key file to use for SSH/RDP access to the instances.
+
+  InstanceTypeParameter: 
+    Type: String
+    Default: "t2.micro"
+    AllowedValues: ["t2.micro", "t3.small", "t3.medium"]
+    Description: "Select the desired instance type."
+
+Resources:
+
+## Roles ##
+
+  GitEC2InstanceProfileRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore        
+        
+
+  EC2InstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref GitEC2InstanceProfileRole
+
+## Networking ##
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: '10.0.0.0/16'
+      EnableDnsSupport: 'true'
+      EnableDnsHostnames: 'true'
+      Tags:
+      - Key: Name
+        Value: OnPremNet
+            
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    DependsOn: VPC
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: '10.0.0.0/24'
+      AvailabilityZone: !Select [ 0, !GetAZs ] 
+      Tags:
+      - Key: Name
+        Value: OnPremNetPubA
+        
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: PublicRT
+
+  PublicRoute:   
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable  
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: '10.0.1.0/24'
+      AvailabilityZone: !Select [ 0, !GetAZs ]   
+      Tags:
+      - Key: Name
+        Value: OnPremNetPrivA
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: PrivateRT
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable          
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  RouteNATGateway:
+    DependsOn: NATGateway
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NATGateway
+
+      
+  # Security Group for the committing git server.  Allow SSH from anywhere, to be attatched to EC2 instance later
+  DevSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: AttachGateway
+    Properties:
+      GroupDescription: Security Group for VPN Server
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: SSHOpen
+      - Key: ResourceGroup
+        Value: CloudFormationResource
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '22'
+        ToPort: '22'
+        CidrIp: 0.0.0.0/0  
+      - IpProtocol: tcp
+        FromPort: '443'
+        ToPort: '443'
+        CidrIp: 0.0.0.0/0           
+        
+## EC2 Infrastructure ##       
+
+  BastionServerInstance:
+      Type: AWS::EC2::Instance
+      Properties:
+        IamInstanceProfile: !Ref EC2InstanceProfile
+        InstanceType: !Ref InstanceTypeParameter
+        ImageId: 
+          Fn::FindInMap:
+          - RegionMap
+          - !Ref AWS::Region
+          - AMI
+        KeyName: !Ref PrivateKeyName
+        NetworkInterfaces:
+          - AssociatePublicIpAddress: true
+            DeviceIndex: 0
+            DeleteOnTermination: true
+            SubnetId: !Join [ ',', [!Ref PublicSubnet] ]
+            GroupSet:
+              - !Ref DevSecurityGroup
+        Tags:
+          - Key: Name
+            Value: Bastion - Git
+        UserData:
+          Fn::Base64:
+            !Join [ "", [
+              "#!/bin/bash\n",
+              "yum update -y\n"] ]
+
+  GitServerInstance:
+      Type: AWS::EC2::Instance
+      Properties:
+        IamInstanceProfile: !Ref EC2InstanceProfile
+        InstanceType: !Ref InstanceTypeParameter
+        ImageId: 
+          Fn::FindInMap:
+          - RegionMap
+          - !Ref AWS::Region
+          - AMI
+        KeyName: !Ref PrivateKeyName
+        NetworkInterfaces:
+          - AssociatePublicIpAddress: false #true
+            DeviceIndex: 0
+            DeleteOnTermination: true
+            SubnetId: !Join [ ',', [!Ref PrivateSubnet] ]
+            GroupSet:
+              - !Ref DevSecurityGroup
+        Tags:
+          - Key: Name
+            Value: Git Server
+        UserData:
+          Fn::Base64:
+            !Join [ "", [
+              "#!/bin/bash\n",
+              "yum update -y\n",
+              "yum install git -y\n"] ]
+ 
+  SSMInterfaceEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        PrivateDnsEnabled: true
+        VpcEndpointType: Interface
+        ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+        VpcId: !Ref VPC
+        SubnetIds: 
+          - !Ref PrivateSubnet
+        SecurityGroupIds:
+          - !Ref DevSecurityGroup
+          
+  SSMMessagesInterfaceEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        PrivateDnsEnabled: true
+        VpcEndpointType: Interface
+        ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+        VpcId: !Ref VPC
+        SubnetIds: 
+          - !Ref PrivateSubnet
+        SecurityGroupIds:
+          - !Ref DevSecurityGroup
+
+  EC2MessagesInterfaceEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        PrivateDnsEnabled: true
+        VpcEndpointType: Interface
+        ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+        VpcId: !Ref VPC
+        SubnetIds: 
+          - !Ref PrivateSubnet
+        SecurityGroupIds:
+          - !Ref DevSecurityGroup
+          
+  GitCodeCommitInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.git-codecommit'
+      VpcId: !Ref VPC
+      SubnetIds: 
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref DevSecurityGroup
+        
+  CodeCommitInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.codecommit'
+      VpcId: !Ref VPC
+      SubnetIds: 
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref DevSecurityGroup

@@ -1,0 +1,335 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: EC2 Instance with Instance profile role to access S3 buckets
+
+Parameters:
+  KeyName:
+    Description: Key name to SSH to VM's. 
+    Type: AWS::EC2::KeyPair::KeyName
+
+Resources:
+  MyCICDEC2InstanceProfileRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: MyCICDEC2InstanceProfilePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:Get*'
+                  - 's3:List*'
+                Resource: '*'
+        - PolicyName: CodeDeployVPCEIAMPermissionsNeeded
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'codedeploy-commands-secure:GetDeploymentSpecification'
+                  - 'codedeploy-commands-secure:PollHostCommand'
+                  - 'codedeploy-commands-secure:PutHostCommandAcknowledgement'
+                  - 'codedeploy-commands-secure:PutHostCommandComplete'
+                Resource: '*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore       
+        
+
+  MyInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref MyCICDEC2InstanceProfileRole
+
+
+## Networking ##
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: '10.10.0.0/16'
+      EnableDnsSupport: 'true'
+      EnableDnsHostnames: 'true'
+      Tags:
+      - Key: Name
+        Value: CloudNet
+             
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    DependsOn: VPC
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: '10.10.0.0/24'
+      AvailabilityZone: !Select [ 0, !GetAZs ]       
+      Tags:
+      - Key: Name
+        Value: CloudNetPubA
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: '10.10.1.0/24'
+      AvailabilityZone: !Select [ 0, !GetAZs ] 
+      Tags:
+      - Key: Name
+        Value: CloudNetPrivA
+        
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: PublicRTCloud
+        
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: PrivateRTCloud
+
+  PublicRoute:   
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable  
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable  
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  RouteNATGateway:
+    DependsOn: NATGateway
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NATGateway
+
+
+  MySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: AttachGateway
+    Properties:
+      GroupDescription: My SG with port 22, 8080 and 80 inbound
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '8080'          
+          ToPort: '8080'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '443'          
+          ToPort: '443'
+          CidrIp: 0.0.0.0/0
+ 
+ 
+  BastionServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      IamInstanceProfile: !Ref MyInstanceProfile
+      InstanceType: t2.micro
+      ImageId: ami-0b5eea76982371e91
+      KeyName: !Ref KeyName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          DeleteOnTermination: true
+          SubnetId: !Join [ ',', [!Ref PublicSubnet] ]
+          GroupSet:
+            - !Ref MySecurityGroup
+      Tags:
+        - Key: Name
+          Value: Bastion - Deployment
+      UserData:
+        Fn::Base64: |  
+          #!/bin/bash
+          sudo yum update
+ 
+ 
+  MyStageVMInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0b5eea76982371e91
+      InstanceType: t2.micro
+      KeyName: !Ref KeyName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false #true
+          DeviceIndex: 0
+          DeleteOnTermination: true
+          SubnetId: !Join [ ',', [!Ref PrivateSubnet] ]
+          GroupSet:
+            - !Ref MySecurityGroup
+      IamInstanceProfile: !Ref MyInstanceProfile
+      Tags:
+        - Key: Name        
+          Value: dev
+      UserData: 
+        Fn::Base64: |  
+          #!/bin/bash
+          sudo yum update
+          sudo yum -y install ruby
+          sudo yum install wget
+          sudo yum -y erase java-1.7.0-openjdk.x86_64
+          sudo yum -y install java-1.8.0-openjdk.x86_64
+          sudo yum -y install java-1.8.0-openjdk-devel
+          sudo amazon-linux-extras install -y tomcat8.5
+          sudo systemctl start tomcat
+          mkdir /usr/share/tomcat/webapps/ROOT
+          touch /usr/share/tomcat/webapps/ROOT/index.html
+          echo "Cloud Formation Tomcat8.5" > /usr/share/tomcat/webapps/ROOT/index.html
+          cd /home/ec2-user
+          wget https://aws-codedeploy-us-east-1.s3.amazonaws.com/latest/install
+          chmod +x ./install
+          sudo ./install auto      
+
+
+  MyProdVMInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0b5eea76982371e91
+      InstanceType: t2.micro
+      KeyName: !Ref KeyName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false #true
+          DeviceIndex: 0
+          DeleteOnTermination: true
+          SubnetId: !Join [ ',', [!Ref PrivateSubnet] ]
+          GroupSet:
+            - !Ref MySecurityGroup
+      IamInstanceProfile: !Ref MyInstanceProfile
+      Tags:
+        - Key: Name        
+          Value: prod
+      UserData: 
+        Fn::Base64: |  
+          #!/bin/bash
+          sudo yum update
+          sudo yum -y install ruby
+          sudo yum install wget
+          sudo yum -y erase java-1.7.0-openjdk.x86_64
+          sudo yum -y install java-1.8.0-openjdk.x86_64
+          sudo yum -y install java-1.8.0-openjdk-devel
+          sudo amazon-linux-extras install -y tomcat8.5
+          sudo systemctl start tomcat
+          mkdir /usr/share/tomcat/webapps/ROOT
+          touch /usr/share/tomcat/webapps/ROOT/index.html
+          echo "Cloud Formation Tomcat8.5" > /usr/share/tomcat/webapps/ROOT/index.html
+          cd /home/ec2-user
+          wget https://aws-codedeploy-us-east-1.s3.amazonaws.com/latest/install
+          chmod +x ./install
+          sudo ./install auto          
+
+
+  SSMInterfaceEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        PrivateDnsEnabled: true
+        VpcEndpointType: Interface
+        ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+        VpcId: !Ref VPC
+        SubnetIds: 
+          - !Ref PrivateSubnet
+        SecurityGroupIds:
+          - !Ref MySecurityGroup
+          
+  SSMMessagesInterfaceEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        PrivateDnsEnabled: true
+        VpcEndpointType: Interface
+        ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+        VpcId: !Ref VPC
+        SubnetIds: 
+          - !Ref PrivateSubnet
+        SecurityGroupIds:
+          - !Ref MySecurityGroup
+
+  EC2MessagesInterfaceEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        PrivateDnsEnabled: true
+        VpcEndpointType: Interface
+        ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+        VpcId: !Ref VPC
+        SubnetIds: 
+          - !Ref PrivateSubnet
+        SecurityGroupIds:
+          - !Ref MySecurityGroup
+
+  CodeDeployInterfaceEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        PrivateDnsEnabled: true
+        VpcEndpointType: Interface
+        ServiceName: !Sub 'com.amazonaws.${AWS::Region}.codedeploy'
+        VpcId: !Ref VPC
+        SubnetIds: 
+          - !Ref PrivateSubnet
+        SecurityGroupIds:
+          - !Ref MySecurityGroup
+
+  CodeDeployCmdInterfaceEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        PrivateDnsEnabled: true
+        VpcEndpointType: Interface
+        ServiceName: !Sub 'com.amazonaws.${AWS::Region}.codedeploy-commands-secure'
+        VpcId: !Ref VPC
+        SubnetIds: 
+          - !Ref PrivateSubnet
+        SecurityGroupIds:
+          - !Ref MySecurityGroup
+      
+Outputs:
+  StageAppURL:
+    Description: Staging Application Access URL
+    Value: !Sub 'http://${MyStageVMInstance.PublicDnsName}:8080/ccdemo/hello'          
+  ProdAppURL:
+    Description: Prod Application Access URL
+    Value: !Sub 'http://${MyProdVMInstance.PublicDnsName}:8080/ccdemo/hello'              
